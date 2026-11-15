@@ -35,6 +35,8 @@ DOWNLOAD_WORKERS = 6           # be gentle with the archive
 MAX_JOBS = 2                   # fields being built at the same time
 UA = "spherex-blink/1.0 (public sky viewer)"
 GAIA_TAP = os.environ.get("SPX_GAIA", "https://gea.esac.esa.int/tap-server/tap/sync")
+VIZIER_TAP = os.environ.get("SPX_VIZIER", "https://tapvizier.cds.unistra.fr/TAPVizieR/tap/sync")  # Gaia DR3 mirror at CDS
+CAT_TIMEOUT = float(os.environ.get("SPX_CAT_TIMEOUT", "12"))  # seconds to wait for each Gaia service
 cats = {}  # Gaia cone searches, kept for a day
 
 jobs, lock = {}, threading.Lock()
@@ -59,59 +61,62 @@ def http_get(url, data=None, timeout=180, tries=3):
     raise last
 
 
-def find_frames(ra, dec, dets=None):
-    """Ask IRSA which SPHEREx spectral images cover this position.
-    One small query per detector array (the same shape as IRSA's own tutorial), because a single
-    query for all six arrays can run so long that IRSA's front door gives up with a 502.
-    Returns (rows, failed): the images found, and how many arrays could not be searched."""
-    def one(d):
-        adql = (
-            "SELECT a.uri AS uri, p.time_bounds_lower AS mjd "
-            "FROM spherex.artifact a JOIN spherex.plane p ON a.planeid = p.planeid "
-            "WHERE 1 = CONTAINS(POINT('ICRS', %.6f, %.6f), p.poly) AND p.energy_bandpassname = 'SPHEREx-D%d' "
-            "ORDER BY p.time_bounds_lower" % (ra, dec, d)
-        )
-        q = urllib.parse.urlencode({"REQUEST": "doQuery", "LANG": "ADQL", "FORMAT": "csv", "QUERY": adql})
-        text = http_get(TAP_URL + "?" + q, timeout=300).decode("utf-8", "replace")
-        rows = []
-        for r in csv.DictReader(io.StringIO(text)):
-            uri = (r.get("uri") or "").strip()
-            if uri.lower().endswith(".fits"):
-                rows.append({"url": uri if uri.startswith("http") else IRSA_ROOT + uri.lstrip("/"),
-                             "mjd": float(r["mjd"]) if r.get("mjd") else 0.0, "det": d})
-        return rows
-    rows, errs = [], []
-    with ThreadPoolExecutor(2) as pool:  # two at a time, to be gentle
-        futs = [pool.submit(one, d) for d in sorted(dets or range(1, 7))]
-        for f in futs:
-            try:
-                rows += f.result()
-            except Exception as e:
-                errs.append(e)
-    if errs and not rows:
-        raise errs[0]
-    return sorted(rows, key=lambda r: r["mjd"]), len(errs)
+def find_frames(ra, dec):
+    """Ask IRSA which SPHEREx spectral images cover this position."""
+    adql = (
+        "SELECT a.uri AS uri, p.time_bounds_lower AS mjd, p.energy_bandpassname AS band "
+        "FROM spherex.artifact a JOIN spherex.plane p ON a.planeid = p.planeid "
+        "WHERE 1 = CONTAINS(POINT('ICRS', %.6f, %.6f), p.poly) ORDER BY p.time_bounds_lower" % (ra, dec)
+    )
+    q = urllib.parse.urlencode({"REQUEST": "doQuery", "LANG": "ADQL", "FORMAT": "csv", "QUERY": adql})
+    text = http_get(TAP_URL + "?" + q, timeout=300).decode("utf-8", "replace")
+    rows = []
+    for r in csv.DictReader(io.StringIO(text)):
+        uri = (r.get("uri") or "").strip()
+        if not uri.lower().endswith(".fits"):
+            continue
+        band = (r.get("band") or "")
+        rows.append({"url": uri if uri.startswith("http") else IRSA_ROOT + uri.lstrip("/"),
+                     "mjd": float(r["mjd"]) if r.get("mjd") else 0.0,
+                     "det": int(band[-1]) if band[-1:].isdigit() else 0})
+    return rows
 
 
 def gaia_cone(ra, dec, r):
-    """Gaia DR3 stars within r degrees, brightest first: [ra, dec, pmra, pmdec, G] at epoch 2016.0."""
+    """Gaia DR3 stars within r degrees, brightest first: [ra, dec, pmra, pmdec, G] at epoch 2016.0.
+    Tries the ESA archive first, then the CDS VizieR copy. Each gets CAT_TIMEOUT seconds, so a slow
+    service can never leave the page waiting for minutes."""
     key = "%.3f_%.3f_%.3f" % (ra, dec, r)
     hit = cats.get(key)
     if hit and time.time() - hit[0] < 86400:
         return hit[1]
-    adql = ("SELECT TOP 400 ra, dec, pmra, pmdec, phot_g_mean_mag AS g FROM gaiadr3.gaia_source "
-            "WHERE 1 = CONTAINS(POINT('ICRS', ra, dec), CIRCLE('ICRS', %.6f, %.6f, %.5f)) "
-            "AND phot_g_mean_mag < 20 ORDER BY phot_g_mean_mag" % (ra, dec, r))
-    q = urllib.parse.urlencode({"REQUEST": "doQuery", "LANG": "ADQL", "FORMAT": "csv", "QUERY": adql})
-    text = http_get(GAIA_TAP + "?" + q, timeout=120).decode("utf-8", "replace")
-    out = []
-    for row in csv.DictReader(io.StringIO(text)):
-        try:  # stars without a proper-motion solution are treated as stationary
-            out.append([float(row["ra"]), float(row["dec"]), float(row["pmra"] or 0), float(row["pmdec"] or 0), float(row["g"])])
-        except (KeyError, ValueError):
-            pass
-    cats[key] = (time.time(), out)
-    return out
+    cone = "1 = CONTAINS(POINT('ICRS', %s, %s), CIRCLE('ICRS', %.6f, %.6f, %.5f))"
+    services = [
+        (GAIA_TAP, "SELECT TOP 400 ra, dec, pmra, pmdec, phot_g_mean_mag AS g FROM gaiadr3.gaia_source WHERE "
+                   + cone % ("ra", "dec", ra, dec, r) + " AND phot_g_mean_mag < 20 ORDER BY phot_g_mean_mag"),
+        (VIZIER_TAP, 'SELECT TOP 400 RA_ICRS, DE_ICRS, pmRA, pmDE, Gmag FROM "I/355/gaiadr3" WHERE '
+                     + cone % ("RA_ICRS", "DE_ICRS", ra, dec, r) + " AND Gmag < 20 ORDER BY Gmag"),
+    ]
+    last = None
+    for url, adql in services:
+        try:
+            q = urllib.parse.urlencode({"REQUEST": "doQuery", "LANG": "ADQL", "FORMAT": "csv", "QUERY": adql})
+            text = http_get(url + "?" + q, timeout=CAT_TIMEOUT, tries=1).decode("utf-8", "replace")
+            out = []
+            for row in csv.DictReader(io.StringIO(text)):
+                d = {k.lower(): v for k, v in row.items() if k}  # the two services name columns differently
+                try:  # stars without a proper-motion solution are treated as stationary
+                    out.append([float(d.get("ra") or d["ra_icrs"]), float(d.get("dec") or d["de_icrs"]),
+                                float(d.get("pmra") or 0), float(d.get("pmdec") or d.get("pmde") or 0),
+                                float(d.get("g") or d["gmag"])])
+                except (KeyError, ValueError):
+                    pass
+            cats[key] = (time.time(), out)
+            return out
+        except Exception as e:
+            last = e
+            print("  Gaia service %s failed: %s" % (url.split("/")[2], e), file=sys.stderr)
+    raise last
 
 
 SESAME = [b.strip() for b in os.environ.get("SPX_SESAME", "https://cds.unistra.fr/cgi-bin/nph-sesame/,https://vizier.idia.ac.za/viz-bin/nph-sesame/,https://vizier.cfa.harvard.edu/viz-bin/nph-sesame/").split(",")]
@@ -182,8 +187,7 @@ def build(key, ra, dec, n, dets, limit, job):
     try:
         with slots:
             job.update(msg="Searching the SPHEREx archive…")
-            found, failed = find_frames(ra, dec, dets)
-            rows = wanted(found, dets, limit)
+            rows = wanted(find_frames(ra, dec), dets, limit)
             if not rows:
                 job.update(state="error", msg="SPHEREx has no images covering that position yet.")
                 return
@@ -212,18 +216,12 @@ def build(key, ra, dec, n, dets, limit, job):
                 job.update(state="error", msg="The archive did not return any image files.")
                 return
             c["frames"] = sorted(c["frames"] + new, key=lambda f: f["mjd"])
-            c["checked"] = time.time() - (FRESH_SECONDS - 600 if failed else 0)  # an array was unreachable: look again in 10 minutes
+            c["checked"] = time.time()
             os.makedirs(CACHE_DIR, exist_ok=True)
             json.dump(c, open(cache_path(key), "w"), separators=(",", ":"))
             job.update(state="done")
     except Exception as e:
         print("job failed:", e, file=sys.stderr)
-        c = load_cache(key)
-        if c and c.get("frames"):  # the archive is down but we already have this field: keep showing it, retry in 10 minutes
-            c["checked"] = time.time() - FRESH_SECONDS + 600
-            json.dump(c, open(cache_path(key), "w"), separators=(",", ":"))
-            job.update(state="done")
-            return
         code = getattr(e, "code", None)
         job.update(state="error", msg="Couldn’t reach the SPHEREx archive (%s)." % ("HTTP %s" % code if code else type(e).__name__)
                    + (" It may be busy, so please try again in a few minutes." if code in (429, 500, 502, 503, 504) else ""))
