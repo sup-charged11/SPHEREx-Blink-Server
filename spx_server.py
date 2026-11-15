@@ -59,25 +59,38 @@ def http_get(url, data=None, timeout=180, tries=3):
     raise last
 
 
-def find_frames(ra, dec):
-    """Ask IRSA which SPHEREx spectral images cover this position."""
-    adql = (
-        "SELECT a.uri AS uri, p.time_bounds_lower AS mjd, p.energy_bandpassname AS band "
-        "FROM spherex.artifact a JOIN spherex.plane p ON a.planeid = p.planeid "
-        "WHERE 1 = CONTAINS(POINT('ICRS', %.6f, %.6f), p.poly) ORDER BY p.time_bounds_lower" % (ra, dec)
-    )
-    q = urllib.parse.urlencode({"REQUEST": "doQuery", "LANG": "ADQL", "FORMAT": "csv", "QUERY": adql})
-    text = http_get(TAP_URL + "?" + q, timeout=300).decode("utf-8", "replace")
-    rows = []
-    for r in csv.DictReader(io.StringIO(text)):
-        uri = (r.get("uri") or "").strip()
-        if not uri.lower().endswith(".fits"):
-            continue
-        band = (r.get("band") or "")
-        rows.append({"url": uri if uri.startswith("http") else IRSA_ROOT + uri.lstrip("/"),
-                     "mjd": float(r["mjd"]) if r.get("mjd") else 0.0,
-                     "det": int(band[-1]) if band[-1:].isdigit() else 0})
-    return rows
+def find_frames(ra, dec, dets=None):
+    """Ask IRSA which SPHEREx spectral images cover this position.
+    One small query per detector array (the same shape as IRSA's own tutorial), because a single
+    query for all six arrays can run so long that IRSA's front door gives up with a 502.
+    Returns (rows, failed): the images found, and how many arrays could not be searched."""
+    def one(d):
+        adql = (
+            "SELECT a.uri AS uri, p.time_bounds_lower AS mjd "
+            "FROM spherex.artifact a JOIN spherex.plane p ON a.planeid = p.planeid "
+            "WHERE 1 = CONTAINS(POINT('ICRS', %.6f, %.6f), p.poly) AND p.energy_bandpassname = 'SPHEREx-D%d' "
+            "ORDER BY p.time_bounds_lower" % (ra, dec, d)
+        )
+        q = urllib.parse.urlencode({"REQUEST": "doQuery", "LANG": "ADQL", "FORMAT": "csv", "QUERY": adql})
+        text = http_get(TAP_URL + "?" + q, timeout=300).decode("utf-8", "replace")
+        rows = []
+        for r in csv.DictReader(io.StringIO(text)):
+            uri = (r.get("uri") or "").strip()
+            if uri.lower().endswith(".fits"):
+                rows.append({"url": uri if uri.startswith("http") else IRSA_ROOT + uri.lstrip("/"),
+                             "mjd": float(r["mjd"]) if r.get("mjd") else 0.0, "det": d})
+        return rows
+    rows, errs = [], []
+    with ThreadPoolExecutor(2) as pool:  # two at a time, to be gentle
+        futs = [pool.submit(one, d) for d in sorted(dets or range(1, 7))]
+        for f in futs:
+            try:
+                rows += f.result()
+            except Exception as e:
+                errs.append(e)
+    if errs and not rows:
+        raise errs[0]
+    return sorted(rows, key=lambda r: r["mjd"]), len(errs)
 
 
 def gaia_cone(ra, dec, r):
@@ -169,7 +182,8 @@ def build(key, ra, dec, n, dets, limit, job):
     try:
         with slots:
             job.update(msg="Searching the SPHEREx archive…")
-            rows = wanted(find_frames(ra, dec), dets, limit)
+            found, failed = find_frames(ra, dec, dets)
+            rows = wanted(found, dets, limit)
             if not rows:
                 job.update(state="error", msg="SPHEREx has no images covering that position yet.")
                 return
@@ -198,12 +212,18 @@ def build(key, ra, dec, n, dets, limit, job):
                 job.update(state="error", msg="The archive did not return any image files.")
                 return
             c["frames"] = sorted(c["frames"] + new, key=lambda f: f["mjd"])
-            c["checked"] = time.time()
+            c["checked"] = time.time() - (FRESH_SECONDS - 600 if failed else 0)  # an array was unreachable: look again in 10 minutes
             os.makedirs(CACHE_DIR, exist_ok=True)
             json.dump(c, open(cache_path(key), "w"), separators=(",", ":"))
             job.update(state="done")
     except Exception as e:
         print("job failed:", e, file=sys.stderr)
+        c = load_cache(key)
+        if c and c.get("frames"):  # the archive is down but we already have this field: keep showing it, retry in 10 minutes
+            c["checked"] = time.time() - FRESH_SECONDS + 600
+            json.dump(c, open(cache_path(key), "w"), separators=(",", ":"))
+            job.update(state="done")
+            return
         code = getattr(e, "code", None)
         job.update(state="error", msg="Couldn’t reach the SPHEREx archive (%s)." % ("HTTP %s" % code if code else type(e).__name__)
                    + (" It may be busy, so please try again in a few minutes." if code in (429, 500, 502, 503, 504) else ""))
